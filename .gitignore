@@ -1,0 +1,21 @@
+# colcon (if someone builds in-place)
+/build/
+/install/
+/log/
+
+# runtime logs the nodes write to CWD
+confidence_log_*.csv
+transmitter_alignment_log_*.csv
+*.pcd
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# editors / os
+.vscode/
+.idea/
+*.swp
+.DS_Store

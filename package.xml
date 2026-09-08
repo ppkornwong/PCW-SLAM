@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<package format="3">
+  <name>pcwslam</name>
+  <version>0.1.0</version>
+  <description>
+    PCW-SLAM: occlusion-aware perception nodes that run on top of a
+    LiDAR-inertial SLAM backend. Dynamic-point filtering that survives the
+    under-vehicle transmitter blind spot, under-chassis landmark / footprint
+    detection, a confidence converter that feeds the SLAM's landmark
+    correction, and transmitter/receiver alignment.
+  </description>
+
+  <maintainer email="ppkornwong@gmail.com">p</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>sensor_msgs_py</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+
+  <!-- Needs a running LiDAR-inertial SLAM backend that publishes
+       /cloud_registered, /aft_mapped_to_init and /path, and exposes a
+       /laserMapping/set_parameters service. Not a build dependency; start it
+       separately or point pcwslam.launch.py at its launch file
+       (slam_launch:= / $PCWSLAM_SLAM_LAUNCH). See README. -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

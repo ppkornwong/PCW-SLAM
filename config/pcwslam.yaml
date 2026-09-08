@@ -1,0 +1,48 @@
+# PCW-SLAM add-on node parameters.
+# Keys are the runtime node names (not the executable names).
+# Load with:  ros2 launch pcwslam pcwslam.launch.py params:=<path>
+
+dynamic_filter_occlusion_aware:
+  ros__parameters:
+    output_topic: "/dynamic_points"
+    movers_topic: "/moving_points"
+    odom_topic: "/aft_mapped_to_init"      # SLAM backend odometry topic
+    az_bins: 720
+    shadow_margin_m: 0.15
+    pose_timeout_s: 1.0
+    require_moving_track: true             # only remove blobs a track confirms moving
+    move_speed_min_mps: 0.15
+    move_confirm_frames: 2
+    publish_status: true
+
+# The default confidence node (pcwslam_confidence / node "confidence_converter")
+# takes NO ros parameters -- its scoring is fixed at the values tuned against
+# the laserMapping gates.
+#
+# The occlusion-robust variant below is only used if you run
+# pcwslam_confidence_lmfreeze instead.
+confidence_converter_landmark_freeze:
+  ros__parameters:
+    landmark_decay_halflife_s: 20.0        # trust decay on a frozen landmark snapshot
+    det_conf_ceiling: 0.75                 # realistic ceiling of /under_car_confidence
+    sensor_smoothing_tau_s: 0.4
+
+transmitter_alignment_node:
+  ros__parameters:
+    # RX (receiver, on the CAR) offset from the detected bbox centre, in the
+    # CAR's own frame.  MEASURE THESE on your vehicle and set them here.
+    car_offset_x_m: -0.1375
+    car_offset_y_m: 0.0
+    # TX (transmitter, on the ROBOT) offset from odom / base_link.
+    robot_offset_x_m: -0.30
+    robot_offset_y_m: 0.01
+    robot_offset_z_m: 0.06                 # robot lift-mechanism height
+    z_sample_radius_m: 0.15
+    z_smoothing_tau_s: 0.5
+    z_settle_time_s: 1.0
+    bbox_timeout_s: 1.0
+    pose_latch_trans_m: 0.10
+    pose_latch_rot_rad: 0.05
+    canvas_px: 500
+    scale_px_per_m: 80.0
+    display_window: true                   # set false for headless
