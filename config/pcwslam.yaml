@@ -10,7 +10,7 @@ dynamic_filter_occlusion_aware:
     az_bins: 720
     shadow_margin_m: 0.15
     pose_timeout_s: 1.0
-    require_moving_track: true             # only remove blobs a track confirms moving
+    require_moving_track: false            # false = remove every diff blob; true = only blobs a track confirms moving
     move_speed_min_mps: 0.15
     move_confirm_frames: 2
     publish_status: true
@@ -18,14 +18,6 @@ dynamic_filter_occlusion_aware:
 # The default confidence node (pcwslam_confidence / node "confidence_converter")
 # takes NO ros parameters -- its scoring is fixed at the values tuned against
 # the laserMapping gates.
-#
-# The occlusion-robust variant below is only used if you run
-# pcwslam_confidence_lmfreeze instead.
-confidence_converter_landmark_freeze:
-  ros__parameters:
-    landmark_decay_halflife_s: 20.0        # trust decay on a frozen landmark snapshot
-    det_conf_ceiling: 0.75                 # realistic ceiling of /under_car_confidence
-    sensor_smoothing_tau_s: 0.4
 
 transmitter_alignment_node:
   ros__parameters:

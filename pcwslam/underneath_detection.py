@@ -544,6 +544,110 @@ class RectSmoother:
 _CHASSIS_SMOOTHER = RectSmoother(alpha=0.25)
 
 
+def _fit_quality(wb_m, tr_m, wb_c, tr_c):
+    """Shared by _find_car_rect_intensity and _find_car_rect: computed from
+    the RAW (pre-clamp) wb_m/tr_m against the clamped wb_c/tr_c -- 1.0 when
+    the raw fit already sat inside the plausible car range and needed no
+    clamping, falling off the more either dimension had to be pulled back
+    to reach it. Must be called before the caller's `rect` var is
+    overwritten with the clamped size -- computing it later from an
+    already-clamped rect would trivially always read back 1.0."""
+    return float(np.clip(
+        1.0 - 0.5 * (abs(wb_m - wb_c) + abs(tr_m - tr_c)), 0.0, 1.0))
+
+
+def _fit_fixed_rect(occ_u8, cx0, cy0, scale):
+    """Fit a car rectangle by template search over centre + yaw + LENGTH.
+
+    Track (short side) is fixed at CAR_TR_FIXED; the length is searched over
+    CAR_WB_SEARCH_M, so a car that is longer/shorter than any one constant
+    still gets a box that fits it. Size cannot be measured from extents (a
+    pole or wall next to the car would stretch the box), so every candidate
+    is scored as
+
+        occupied inside
+      - CAR_EMPTY_PENALTY x EMPTY pixels inside   (stops it growing for free)
+      - CAR_RING_PENALTY  x occupied pixels in a margin band just outside
+                                                   (stops it stopping short)
+
+    A longer box only wins if the extra strip is mostly occupied AND the ring
+    beyond it is mostly empty.
+
+    Returns (ok, rect, fit_quality); rect is cv2-style
+    ((cx,cy),(L_px,W_px),angle) with L along `angle` (pixel space), same
+    convention as _fit_rect_robust."""
+    # search at half resolution (~3 cm/px) -- 4x cheaper, ample for a 2.7 m box
+    ds = 2
+    occ_u8 = cv2.resize(occ_u8, (occ_u8.shape[1] // ds, occ_u8.shape[0] // ds),
+                        interpolation=cv2.INTER_AREA)
+    cx0, cy0, scale_full = cx0 / ds, cy0 / ds, scale
+    scale = scale / ds
+    h, w = occ_u8.shape
+    # binary occupancy; clipped so the dense near-sensor block counts the
+    # same as sparse far returns
+    occ = (occ_u8 > CAR_OCC_THRESH).astype(np.float32)
+    if occ.sum() < 50:
+        return False, None, 0.0
+
+    W  = int(round(CAR_TR_FIXED * scale)) | 1
+    m  = int(round(CAR_RING_MARGIN_M * scale))
+    Wo = (W + 2 * m) | 1
+    lens = [(wb, int(round(wb * scale)) | 1) for wb in CAR_WB_SEARCH_M]
+
+    yy, xx = np.ogrid[:h, :w]
+    allowed = ((xx - cx0) ** 2 + (yy - cy0) ** 2
+               <= (CAR_CENTER_SEARCH_M * scale) ** 2)
+
+    def search(a, lens_):
+        M = cv2.getRotationMatrix2D((cx0, cy0), a, 1.0)
+        r = cv2.warpAffine(occ, M, (w, h), flags=cv2.INTER_LINEAR)
+        best_ = None
+        for wb, L in lens_:
+            Lo = (L + 2 * m) | 1
+            area_in   = float(L * W)
+            area_ring = float(Lo * Wo) - area_in
+            s_in  = cv2.boxFilter(r, -1, (W, L),   normalize=False,
+                                  borderType=cv2.BORDER_CONSTANT)
+            s_out = cv2.boxFilter(r, -1, (Wo, Lo), normalize=False,
+                                  borderType=cv2.BORDER_CONSTANT)
+            score = (s_in - CAR_EMPTY_PENALTY * (area_in - s_in)
+                     - CAR_RING_PENALTY * (s_out - s_in))
+            score[~allowed] = -np.inf
+            iy, ix = np.unravel_index(np.argmax(score), score.shape)
+            cand = (float(score[iy, ix]), a, wb, L, ix, iy,
+                    float(s_in[iy, ix]) / area_in,
+                    float(s_out[iy, ix] - s_in[iy, ix]) / area_ring, M)
+            if best_ is None or cand[0] > best_[0]:
+                best_ = cand
+        return best_
+
+    best = None
+    for a in np.arange(-CAR_YAW_SEARCH_DEG, CAR_YAW_SEARCH_DEG + 0.1, 6.0):
+        cand = search(float(a), lens)
+        if best is None or cand[0] > best[0]:
+            best = cand
+    fine_lens = [(wb, int(round(wb * scale)) | 1)
+                 for wb in (best[2] - 0.1, best[2], best[2] + 0.1)
+                 if CAR_WB_SEARCH_M[0] <= wb <= CAR_WB_SEARCH_M[-1] + 1e-6]
+    for da in (-3.0, -1.5, 1.5, 3.0):               # fine refine
+        cand = search(best[1] + da, fine_lens)
+        if cand[0] > best[0]:
+            best = cand
+
+    _, _, wb_best, _, ix, iy, fill_in, fill_ring, M = best
+    if not np.isfinite(best[0]) or fill_in < CAR_MIN_FILL:
+        return False, None, 0.0
+
+    Minv = cv2.invertAffineTransform(M)
+    c  = Minv @ np.array([ix, iy, 1.0])
+    p2 = Minv @ np.array([ix, iy + 1.0, 1.0])         # box long axis = image vertical
+    ang = float(np.degrees(np.arctan2(p2[1] - c[1], p2[0] - c[0])))
+    rect = ((float(c[0]) * ds, float(c[1]) * ds),
+            (wb_best * scale_full, CAR_TR_FIXED * scale_full), ang)
+    quality = float(np.clip((fill_in - fill_ring) / 0.5, 0.0, 1.0))
+    return True, rect, quality
+
+
 def _find_car_rect_intensity(metal_gray, plastic_gray, rubber_gray,
                              hole_cx, hole_cy, scale, annotated=None):
     """Corrected material logic:
@@ -556,35 +660,13 @@ def _find_car_rect_intensity(metal_gray, plastic_gray, rubber_gray,
                           the old rubber-vs-metal check told us nothing)"""
     h, w = metal_gray.shape
 
-    # ── 1. chassis footprint from the perimeter band ─────────────
-    perimeter = cv2.max(plastic_gray, rubber_gray)
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
-    perimeter = cv2.morphologyEx(perimeter, cv2.MORPH_CLOSE, k)
-    # undo the per-band dilation so the fit hugs the true footprint
-    perimeter = cv2.erode(perimeter,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)))
-
-    ok, rect = _fit_rect_robust(perimeter, hole_cx, hole_cy, scale,
-                                inner_x_m=0.35, inner_y_m=0.35,
-                                outer_x_m=1.9,  outer_y_m=1.5)
+    # ── 1. chassis rectangle: fixed size, pose from template search ──
+    # Occupancy of ALL three material bands (the car body is the dense
+    # mass; poles/walls are isolated and fall outside the box).
+    occ = cv2.max(cv2.max(metal_gray, plastic_gray), rubber_gray)
+    ok, rect, fit_quality = _fit_fixed_rect(occ, hole_cx, hole_cy, scale)
     if not ok:
-        # last resort: fit whatever the metal band gives (battery-sized,
-        # will be clamped up to CAR_WB_MIN/TR_MIN below)
-        ok, rect = _fit_rect_robust(metal_gray, hole_cx, hole_cy, scale,
-                                    inner_x_m=0.10, inner_y_m=0.10,
-                                    outer_x_m=1.5,  outer_y_m=1.2,
-                                    thresh=10, min_pts=15)
-        if not ok:
-            return False, None, {}
-
-    (cx,cy),(bw,bh),angle = rect
-    wb_m = max(bw,bh)/scale
-    tr_m = min(bw,bh)/scale
-    wb_c = float(np.clip(wb_m, CAR_WB_MIN, CAR_WB_MAX))
-    tr_c = float(np.clip(tr_m, CAR_TR_MIN, CAR_TR_MAX))
-    rect = ((cx,cy),
-            (wb_c*scale if bw>=bh else tr_c*scale,
-             wb_c*scale if bh>=bw else tr_c*scale), angle)
+        return False, None, {}, 0.0
 
     # temporal smoothing: rect converges onto the car over ~10 frames
     rect = _CHASSIS_SMOOTHER.update(rect)
@@ -622,8 +704,25 @@ def _find_car_rect_intensity(metal_gray, plastic_gray, rubber_gray,
     STABLE_FRAMES_FOR_GEOM  = 10     # matches _CHASSIS_SMOOTHER's own comment
     rect_is_stable = _CHASSIS_SMOOTHER.n_updates >= STABLE_FRAMES_FOR_GEOM
 
-    box_pts   = cv2.boxPoints(rect)
+    # Wheels sit CAR_WHEELBASE_M apart along the body axis, inset from the
+    # body ends (overhangs), so use a wheel rect, not the body rect's corners.
+    (_wx, _wy), (_bw, _bh), _wa = rect
+    wheel_rect = ((_wx, _wy),
+                  (CAR_WHEELBASE_M * scale, _bh) if _bw >= _bh
+                  else (_bw, CAR_WHEELBASE_M * scale), _wa)
+    box_pts   = cv2.boxPoints(wheel_rect)
     search_px = max(6, int(0.45*scale))   # ~45 cm search window
+
+    # A pole just outside the car sits inside a corner's search window and
+    # used to confirm as a "rubber" wheel. Only returns within the box
+    # (plus CAR_WHEEL_PAD_M) may count toward a wheel.
+    pad2 = 2.0 * CAR_WHEEL_PAD_M * scale
+    foot = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(foot, [np.int32(cv2.boxPoints(
+        (rect[0], (rect[1][0] + pad2, rect[1][1] + pad2), rect[2])))], 255)
+    rubber_gray  = cv2.bitwise_and(rubber_gray,  foot)
+    plastic_gray = cv2.bitwise_and(plastic_gray, foot)
+    metal_gray   = cv2.bitwise_and(metal_gray,   foot)
     wheel_conf   = {}
     corner_names = ["FL","FR","RL","RR"]
 
@@ -698,14 +797,14 @@ def _find_car_rect_intensity(metal_gray, plastic_gray, rubber_gray,
                             f"{nm} r={wc['rubber_score']:.0f}/p={wc['plastic_score']:.0f}",
                             (wc["px"]+4,wc["py"]-4),
                             cv2.FONT_HERSHEY_SIMPLEX,0.24,col,1,cv2.LINE_AA)
-        return True, rect, wheel_conf
+        return True, rect, wheel_conf, fit_quality
 
     if annotated is not None:
         cv2.putText(annotated,
                     f"stabilizing {_CHASSIS_SMOOTHER.n_updates}/{STABLE_FRAMES_FOR_GEOM}",
                     (5, annotated.shape[0]-40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.30, (0,140,255), 1, cv2.LINE_AA)
-    return False, None, {}
+    return False, None, {}, 0.0
 
 
 def _draw_robot_marker(img, size, label=""):
@@ -733,6 +832,23 @@ CAR_WB_MIN, CAR_WB_MAX = 1.8, 2.75
 CAR_TR_MIN, CAR_TR_MAX = 0.8, 2.0
 CAR_CLOSE_K  = 9
 
+# Chassis template for _fit_fixed_rect. Track (short side) is fixed -- MEASURE
+# it on your car; length (long side) is searched over CAR_WB_SEARCH_M.
+CAR_TR_FIXED = 1.70
+# The fitted rectangle is the whole car BODY (measured ~4.15 m); its length is
+# SEARCHED (coarse 0.2 m grid, refined +-0.1 m). Wheels are placed from
+# CAR_WHEELBASE_M, not from the body ends.
+CAR_WB_SEARCH_M = [round(x, 2) for x in np.arange(3.4, 4.61, 0.2)]   # OVERALL body length
+CAR_WHEELBASE_M = 2.75        # axle-to-axle; wheel corners sit this far apart
+CAR_EMPTY_PENALTY = 0.5       # weight of empty pixels inside the box
+CAR_YAW_SEARCH_DEG   = 30.0   # car long axis may differ from robot heading by this
+CAR_CENTER_SEARCH_M  = 1.2    # box centre must lie within this of the robot
+CAR_RING_MARGIN_M    = 0.25   # band outside the box that counts against a fit
+CAR_RING_PENALTY     = 0.5    # weight of occupied pixels in that band
+CAR_MIN_FILL         = 0.15   # min fraction of box occupied, else no detection
+CAR_OCC_THRESH       = 15     # band gray level counted as occupied
+CAR_WHEEL_PAD_M      = 0.15   # wheel evidence must lie within box + this
+
 # Publish floor for the fitted chassis rectangle ("green box"). RectSmoother
 # EMAs the box in from whatever the first few frames find, so early on it can
 # report a wheelbase well under the true ~2.7-2.75m before converging -- that
@@ -741,6 +857,8 @@ CAR_CLOSE_K  = 9
 # clipped up to CAR_WB_MIN, so this is a separate, stricter "trust it yet"
 # gate, not a re-statement of the clip range.
 WB_PUBLISH_MIN_M = 2.7
+# Same gate for the intensity path, where the box is the whole body (~4.15 m).
+LEN_PUBLISH_MIN_M = 3.6
 
 ARCH_TOP_FRAC   = 0.60
 ARCH_COL_WIN    = 20
@@ -844,7 +962,7 @@ def _find_car_rect(gray_bev, hole_cx, hole_cy, scale, annotated=None,
                 cv2.putText(annotated, "chassis: too few peaks",
                             (10,h-12), cv2.FONT_HERSHEY_SIMPLEX,
                             0.30, (100,100,255), 1, cv2.LINE_AA)
-            return False, None
+            return False, None, 0.0
         pts  = np.column_stack([xs,ys]).astype(np.int32)
         hull = cv2.convexHull(pts.reshape(-1,1,2))
         rect = cv2.minAreaRect(hull)
@@ -897,6 +1015,7 @@ def _find_car_rect(gray_bev, hole_cx, hole_cy, scale, annotated=None,
                      wb_c*scale if bh>=bw else tr_c*scale), angle)
 
     dim_ok = not (wb_m > CAR_WB_MAX or tr_m > CAR_TR_MAX)
+    fit_quality = _fit_quality(wb_m, tr_m, wb_c, tr_c)
     if annotated is not None:
         lbl = f"wb={wb_c:.1f}m tr={tr_c:.1f}m"
         col = (0,200,80) if dim_ok else (0,100,255)
@@ -905,7 +1024,7 @@ def _find_car_rect(gray_bev, hole_cx, hole_cy, scale, annotated=None,
         cv2.putText(annotated, lbl, (int(cx)+6,int(cy)-8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.30, col, 1, cv2.LINE_AA)
 
-    return dim_ok, rect
+    return dim_ok, rect, fit_quality
 
 
 # ================================================================
@@ -1022,14 +1141,15 @@ def detect_bev(bev_dilated_img, scale=BEV_SCALE,
     # succeeding.
     if (metal_gray is not None and plastic_gray is not None
             and rubber_gray is not None):
-        _rect_result = _find_car_rect_intensity(
+        rect_ok, rect, int_wheel_conf, fit_quality = _find_car_rect_intensity(
             metal_gray, plastic_gray, rubber_gray,
             ou, ov, scale, annotated)
-        rect_ok, rect, int_wheel_conf = _rect_result[0], _rect_result[1], _rect_result[2] if len(_rect_result)>2 else {}
     else:
-        rect_ok, rect = _find_car_rect(gray, ou, ov, scale, annotated,
-                                        metal_gray=metal_gray)
+        rect_ok, rect, fit_quality = _find_car_rect(gray, ou, ov, scale, annotated,
+                                                     metal_gray=metal_gray)
         int_wheel_conf = {}
+    body_fit = bool(int_wheel_conf) or (metal_gray is not None and plastic_gray is not None
+                                        and rubber_gray is not None)
 
     # Hole detection no longer runs here -- moved to the blind-spot frame
     # (see _process_frame), which stays robust to the ring being partially
@@ -1039,6 +1159,11 @@ def detect_bev(bev_dilated_img, scale=BEV_SCALE,
         (cx,cy),(bw,bh),ang = rect
         wb_m = max(bw,bh)/scale
         tr_m = min(bw,bh)/scale
+        # fit_quality came back from _find_car_rect[_intensity]() above --
+        # previously nothing ever set it on the car_landmark detection, so
+        # cross_check_detections()'s 40%-weighted rect-quality term silently
+        # scored 0 for every frame regardless of how good the fit actually
+        # was.
         car_x = (ov-cy)/scale
         car_y = -(cx-ou)/scale
         # Convert the rect's angle (measured in pixel space by
@@ -1091,7 +1216,7 @@ def detect_bev(bev_dilated_img, scale=BEV_SCALE,
         cv2.line(annotated,(cu-cs,cv_),(cu+cs,cv_),col,2)
         cv2.line(annotated,(cu,cv_-cs),(cu,cv_+cs),col,2)
         cv2.putText(annotated,
-                    f"CAR {car_x:.1f},{car_y:.1f}m wb={wb_m:.1f} tr={tr_m:.1f} w={n_conf}/4",
+                    f"CAR {car_x:.1f},{car_y:.1f}m len={wb_m:.1f} tr={tr_m:.1f} w={n_conf}/4",
                     (cu+14,cv_-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.30, col, 1, cv2.LINE_AA)
 
@@ -1117,8 +1242,10 @@ def detect_bev(bev_dilated_img, scale=BEV_SCALE,
             "type":"car_landmark",
             "distance":float(np.hypot(car_x,car_y)),
             "x":float(car_x),"y":float(car_y),
-            "wheelbase":float(wb_m),"track":float(tr_m),
+            "wheelbase":float(CAR_WHEELBASE_M if body_fit else wb_m),
+            "length":float(wb_m),"body_fit":body_fit,"track":float(tr_m),
             "n_wheels":n_conf,"corner_conf":n_conf/4.,
+            "fit_quality":fit_quality,
             "view":"bev",
             "angle_rad":car_angle_rad,
         })
@@ -1169,9 +1296,6 @@ def detect_perspective(args):
 # CROSS-CHECK
 # ================================================================
 def cross_check_detections(bev_dets, side_dets_by_view):
-  import numpy as np
-
-def cross_check_detections(bev_dets, side_dets_by_view):
     """
     Compute an overall confidence score from all detection sources.
 
@@ -1182,9 +1306,10 @@ def cross_check_detections(bev_dets, side_dets_by_view):
     Wheel detection     : 20%
     Side-view evidence  : 10%
 
-    Quality is graded instead of binary. A nonlinear mapping prevents
-    confidence from saturating at 1.0 unless every detector is extremely
-    reliable.
+    Quality is graded instead of binary (each term is itself a [0,1]
+    factor, several nonlinearly attenuated -- see hole_q/fit_q/side_q
+    below), so confidence only nears 1.0 once every detector is near its
+    own best case, without needing an extra squashing function on top.
     """
 
     hole_dets = [d for d in bev_dets if d["type"] == "lidar_hole"]
@@ -1283,7 +1408,16 @@ def cross_check_detections(bev_dets, side_dets_by_view):
     # -------------------------------------------------------------
     # Final confidence
     # -------------------------------------------------------------
-    confidence = np.tanh(1.5 * raw_score)
+    # raw_score is already bounded to [0,1]: every term above is a weight
+    # times a [0,1]-clipped quality factor, and the weights (0.30+0.40+
+    # 0.20+0.10) sum to exactly 1.0, so no extra squashing is needed to
+    # keep it in range. The previous tanh(1.5*raw_score) didn't just cap
+    # the top -- for raw_score below ~0.87 it AMPLIFIES (tanh(1.5x) > x),
+    # so partial evidence (e.g. raw_score=0.28, decent hole+rect quality
+    # with zero wheels/sides confirmed) was already crossing the 0.40
+    # publish gate before the slower-to-arrive side/wheel evidence had a
+    # chance to weigh in.
+    confidence = raw_score
 
     evidence.append(
         f"Raw={raw_score:.2f}"
@@ -1294,8 +1428,6 @@ def cross_check_detections(bev_dets, side_dets_by_view):
     )
 
     return float(confidence), evidence
-
-    return min(score,1.0), evidence
 
 
 # ================================================================
@@ -1413,6 +1545,10 @@ class IntensityLandmarkNode(Node):
         # chassis footprint (e.g. transmitter-alignment estimation) and
         # don't need the full cross-checked confidence score.
         self.car_bbox_pub     = self.create_publisher(String,  "/car_bbox_dims",        10)
+        # per-corner wheel scores (was a terminal INFO) -> ros2 topic echo /wheel_debug
+        self.wheel_debug_pub  = self.create_publisher(String,  "/wheel_debug",          10)
+        # per-detection [CAR] summary (was a terminal INFO) -> ros2 topic echo /car_debug
+        self.car_debug_pub    = self.create_publisher(String,  "/car_debug",            10)
 
         # FIX 4: Display loop runs on the MAIN thread (via a ROS timer) to keep
         # cv2.imshow on the thread that created the window. On most platforms
@@ -1739,8 +1875,17 @@ class IntensityLandmarkNode(Node):
                   np.zeros((H_pv,W_pv),np.float32))
 
         if hole_ok:
+            # live_cloud (self.buffer's short rolling window), NOT cloud (the
+            # spatially-persistent voxel layer): cloud keeps a last-seen
+            # point per voxel indefinitely as long as it's within the ROI
+            # (see the "long-run hollowing" fix above), so once the robot
+            # has actually driven under the car, these side views were still
+            # rendering stale pre-maneuver returns instead of reflecting
+            # that the car body now occludes half the current scan -- the
+            # same real-time occlusion build_blind_spot_view()'s live_cloud
+            # already shows correctly for the blind-spot circle.
             front_t, rear_t, left_t, right_t = four_views(
-                cloud, W_pv, H_pv, self._dilate_kernel)
+                live_cloud, W_pv, H_pv, self._dilate_kernel)
         else:
             front_t = rear_t = left_t = right_t = _blank
 
@@ -1774,7 +1919,7 @@ class IntensityLandmarkNode(Node):
         left_ann,  left_det  = results["left"]
         right_ann, right_det = results["right"]
 
-        side_by_view = {"rear":rear_det,"left":left_det,"right":right_det}
+        side_by_view = {"front":front_det,"rear":rear_det,"left":left_det,"right":right_det}
         conf_score, evidence = cross_check_detections(bev_dets, side_by_view)
 
         # Publish
@@ -1811,7 +1956,8 @@ class IntensityLandmarkNode(Node):
                     f"(r{d.get('rubber_score',0):.0f}"
                     f"/p{d.get('plastic_score',0):.0f})"
                     for d in corners)
-                self.get_logger().info(f"[WHEELS] {int(wc.data)}/4  {dbg}")
+                self.wheel_debug_pub.publish(
+                    String(data=f"[WHEELS] {int(wc.data)}/4  {dbg}"))
 
         side_conf = sum(1 for v in side_by_view.values()
                         for d in v if d["type"] == "under_car")
@@ -1824,7 +1970,8 @@ class IntensityLandmarkNode(Node):
         # too-small box is equally misleading whether or not conf_score has
         # crossed its own gate.
         car_dets = [d for d in car_dets
-                    if d.get('wheelbase', 0.) >= WB_PUBLISH_MIN_M]
+                    if d.get('length', 0.) >=
+                    (LEN_PUBLISH_MIN_M if d.get('body_fit') else WB_PUBLISH_MIN_M)]
         if car_dets:
             bd = car_dets[0]
             bbox_msg = String()
@@ -1840,9 +1987,9 @@ class IntensityLandmarkNode(Node):
                        f"{c.get('wheelbase',0.):.4f},{c.get('track',0.):.4f},"
                        f"{c.get('n_wheels',0)},{conf_score:.3f}")
             self.car_landmark_pub.publish(cm)
-            self.get_logger().info(
+            self.car_debug_pub.publish(String(data=
                 f"[CAR] x={c['x']:.2f} y={c['y']:.2f} "
-                f"wb={c.get('wheelbase',0):.2f} conf={conf_score:.2f} {evidence}")
+                f"wb={c.get('wheelbase',0):.2f} conf={conf_score:.2f} {evidence}"))
 
         # Compose surround view image
         cc  = (0, int(conf_score*255), int((1-conf_score)*180))

@@ -7,6 +7,7 @@ when the SLAM is already running in another terminal / launch.
 
     ros2 launch pcwslam nodes_only.launch.py
 
+robot_model:=false skips the URDF / TF (see robot_model.launch.py).
 Same per-node toggles and `params:` / `display:` args as pcwslam.launch.py.
 """
 
@@ -14,8 +15,9 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -30,12 +32,17 @@ def generate_launch_description():
         DeclareLaunchArgument("confidence", default_value="true"),
         DeclareLaunchArgument("transmitter", default_value="true"),
         DeclareLaunchArgument("display", default_value="true"),
+        DeclareLaunchArgument("robot_model", default_value="true"),
         DeclareLaunchArgument("params", default_value=default_params),
     ]
     params = LaunchConfiguration("params")
     common = dict(output="screen", parameters=[params])
 
     return LaunchDescription(args + [
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(
+                os.path.join(pkg_share, "launch", "robot_model.launch.py")),
+            condition=IfCondition(LaunchConfiguration("robot_model"))),
         Node(package="pcwslam", executable="pcwslam_dynamic_filter",
              name="dynamic_filter_occlusion_aware",
              condition=IfCondition(LaunchConfiguration("dynamic_filter")), **common),

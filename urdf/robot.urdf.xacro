@@ -1,0 +1,107 @@
+<?xml version="1.0"?>
+<!--
+  PCW robot: 750 x 750 mm square chassis, diff-drive, Unitree L1 on the front edge.
+
+  base_link sits on the ground, directly under the midpoint of the drive-wheel
+  axle (= centre of rotation), x forward, y left, z up (REP-103).
+
+  Dimensions from the drawing (mm):
+    chassis 750 x 750, top of chassis 115.53 above ground, top of LiDAR 154.35
+    drive axle 100 from the rear edge, wheel diameter 100, wheels on left/right sides
+    LiDAR centred left/right, ~46 from the front edge
+
+  Anything marked MEASURE is read off the drawing; check it on the robot.
+  The launch file passes the lidar_* args, so change them there, not here.
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pcw_robot">
+
+  <!-- chassis -->
+  <xacro:property name="body_len"      value="0.750"/>
+  <xacro:property name="body_wid"      value="0.750"/>
+  <xacro:property name="body_top"      value="0.11553"/>
+  <xacro:property name="body_clear"    value="0.018"/>   <!-- MEASURE: ground clearance -->
+  <!-- drive wheels -->
+  <xacro:property name="wheel_r"       value="0.050"/>
+  <xacro:property name="wheel_w"       value="0.030"/>   <!-- MEASURE -->
+  <xacro:property name="wheel_sep"     value="0.650"/>   <!-- MEASURE: wheel centre to wheel centre -->
+  <xacro:property name="axle_from_rear" value="0.100"/>
+
+  <!-- LiDAR mount in base_link (the point Point-LIO's aft_mapped tracks) -->
+  <xacro:arg name="lidar_x"   default="0.604"/>
+  <xacro:arg name="lidar_y"   default="0.0"/>
+  <xacro:arg name="lidar_z"   default="0.122"/>
+  <xacro:arg name="lidar_yaw" default="0.0"/>  <!-- mount is square now (offset fixed mechanically) -->
+
+  <!-- chassis centre relative to the axle -->
+  <xacro:property name="body_cx" value="${body_len/2 - axle_from_rear}"/>
+  <xacro:property name="body_h"  value="${body_top - body_clear}"/>
+
+  <material name="body_grey"><color rgba="0.62 0.64 0.74 1.0"/></material>
+  <material name="tyre_black"><color rgba="0.1 0.1 0.1 1.0"/></material>
+  <material name="lidar_dark"><color rgba="0.25 0.25 0.28 1.0"/></material>
+
+  <link name="base_link"/>
+
+  <!-- chassis -->
+  <link name="chassis_link">
+    <visual>
+      <origin xyz="0 0 ${body_h/2}"/>
+      <geometry><box size="${body_len} ${body_wid} ${body_h}"/></geometry>
+      <material name="body_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${body_h/2}"/>
+      <geometry><box size="${body_len} ${body_wid} ${body_h}"/></geometry>
+    </collision>
+  </link>
+  <joint name="chassis_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="chassis_link"/>
+    <origin xyz="${body_cx} 0 ${body_clear}"/>
+  </joint>
+
+  <!-- drive wheels. fixed until something publishes /joint_states for them;
+       then switch to type="continuous" with <axis xyz="0 1 0"/>. -->
+  <xacro:macro name="wheel" params="side y">
+    <link name="${side}_wheel_link">
+      <visual>
+        <origin rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+        <material name="tyre_black"/>
+      </visual>
+      <collision>
+        <origin rpy="${pi/2} 0 0"/>
+        <geometry><cylinder radius="${wheel_r}" length="${wheel_w}"/></geometry>
+      </collision>
+    </link>
+    <joint name="${side}_wheel_joint" type="fixed">
+      <parent link="base_link"/>
+      <child link="${side}_wheel_link"/>
+      <origin xyz="0 ${y} ${wheel_r}"/>
+    </joint>
+  </xacro:macro>
+  <xacro:wheel side="left"  y="${wheel_sep/2}"/>
+  <xacro:wheel side="right" y="${-wheel_sep/2}"/>
+
+  <!-- Unitree L1 (~75 x 75 x 65 mm) -->
+  <link name="lidar_link">
+    <visual>
+      <geometry><box size="0.075 0.075 0.065"/></geometry>
+      <material name="lidar_dark"/>
+    </visual>
+  </link>
+  <joint name="lidar_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="lidar_link"/>
+    <origin xyz="$(arg lidar_x) $(arg lidar_y) $(arg lidar_z)" rpy="0 0 $(arg lidar_yaw)"/>
+  </joint>
+
+  <!-- transmitter coil: centre of the chassis, on top -->
+  <link name="transmitter_link"/>
+  <joint name="transmitter_joint" type="fixed">
+    <parent link="chassis_link"/>
+    <child link="transmitter_link"/>
+    <origin xyz="0 0 ${body_h}"/>
+  </joint>
+
+</robot>

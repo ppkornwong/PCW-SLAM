@@ -2,95 +2,24 @@
 # ================================================================
 # DynamicFilterOcclusionAware
 #
-# NEW FILE. Does not modify dynamic_detect_5.py.
-# *** RUN THIS INSTEAD OF dynamic_detect_5.py, NOT ALONGSIDE IT ***
-# (both publish /dynamic_points by default; two publishers on the
-#  same topic would interleave two different clouds downstream).
+# Short-window BEV diff, robot-following (same algorithm as
+# ws/dynamic_detect_1_person_follow.py), publishing the CLEANED cloud.
 #
-# ----------------------------------------------------------------
-# WHY THIS EXISTS
-# ----------------------------------------------------------------
-# dynamic_detect_5.py:186-192 documents its core premise as:
+#   - every scan is moved into the robot frame (pose = x, y, yaw), so
+#     the BEV window follows/rotates with the robot
+#   - current image   = last DIFF_WINDOW_SEC seconds of points
+#   - reference image = the DIFF_WINDOW_SEC window as it was
+#                       DIFF_DELAY_SEC ago, re-rendered at the CURRENT
+#                       pose so static objects land on identical pixels
+#   - "gone" pixels (bright in ref, dark now) -> grid cells -> blobs;
+#     every point in a blob column is removed
 #
-#     "/cloud_registered is an accumulating SLAM output, so:
-#        - 'disappeared' pixels = something WAS there and moved -> signal"
+# Kept from the earlier occlusion-aware version: gone pixels only count
+# where the sensor actually saw this frame (ray-cast observed mask), and
+# with no fresh pose the whole cloud passes through untouched.
 #
-# That premise does not hold for this SLAM fork. In
-# laserMapping.cpp, publish_frame_world() (lines 521-577) rebuilds the
-# /cloud_registered message from scratch every scan out of
-# feats_down_world -- it publishes ONLY the current scan's points
-# transformed to world frame. There is no accumulation on the C++ side.
-# (The dense "map" seen in rviz is rviz's own Decay Time display
-# holding a window of past per-scan messages, not a persisted cloud.)
-#
-# Consequence: "disappeared" does NOT uniquely mean "moved". A pixel
-# goes dark for ANY reason the current scan lacks a return there:
-#     - occlusion  (the 3cm transmitter under the car)  <-- the problem
-#     - the surface leaving the sensor FOV as the robot moves
-#     - range dropout / grazing incidence
-#     - ordinary scan-pattern variation
-#
-# dynamic_detect_5's two-EMA diff, 9x9 dilation and PERSIST_K=3 gate
-# all defend against *random* flicker. Occlusion is *systematic and
-# persistent*, so it defeats every one of them: the fast EMA
-# (alpha=0.35) collapses in ~3 frames while the slow reference
-# (alpha=0.05) holds the stale brightness for ~2s, the diff lights up,
-# and the persistence counter only climbs because a shadow -- unlike
-# flicker -- never blinks off. BLOB_MAX_PX = CELL_PX^2 * 24 = 2400 px^2
-# is ~0.74 m^2 at this BEV scale, i.e. person-sized by construction, so
-# the occlusion shadow is then accepted as a person and its points are
-# removed COLUMN-WISE AT ALL HEIGHTS (dynamic_detect_5.py:394-399),
-# taking the car undercarriage with it -- which is exactly the data
-# underneath_detection_6.py needs to fit its chassis rectangle.
-#
-# The SLAM itself never subscribes to /dynamic_points (it consumes the
-# raw lidar topic and PUBLISHES /cloud_registered), which is why the
-# mapping result looks unaffected while the detection pipeline starves.
-#
-# ----------------------------------------------------------------
-# THE FIX: free space vs unknown space
-# ----------------------------------------------------------------
-# Absence of a return is only evidence of change if the sensor actually
-# looked there. This node separates the two cases by ray casting from
-# the sensor origin, the standard occupancy-grid free/unknown split:
-#
-#   for each azimuth bin, r_first = range of the nearest return
-#     r <  r_first - margin : ray passed through  -> FREE      (observed)
-#     |r - r_first| <= margin : the surface itself -> OCCUPIED (observed)
-#     r >  r_first + margin : behind an obstacle  -> SHADOW    (UNKNOWN)
-#     no returns in that bin at all               -> UNKNOWN
-#
-# Disappearance is only believed where the pixel is OBSERVED this
-# frame. In shadow the reference image is frozen (not decayed) and the
-# persistence counter is held, so occluded geometry is never mistaken
-# for departed geometry.
-#
-# This keeps genuine person removal intact: when someone walks away,
-# the rays that used to stop on them now reach the background, so
-# r_first grows and their old location becomes observed-free -- a real
-# disappearance, and still removed. When the transmitter blocks the
-# undercarriage, those rays stop early, the region behind is unknown,
-# and nothing is removed.
-#
-# Secondary gate (require_moving_track, default on): a blob is only
-# removed if the tracker has confirmed it actually moving. Note that
-# dynamic_detect_5.py already computes per-track vx/vy but never uses
-# them for removal -- the velocities feed only its log line.
-#
-# Re-baselining: when a pixel returns from shadow to observed, its
-# reference is reset to the current frame rather than diffed against a
-# value from before the occlusion, so a long occluded stretch does not
-# produce one large false "disappearance" the moment visibility
-# returns.
-#
-# Fails SAFE: with no pose yet, or no returns to raycast, the full
-# cloud is passed through unfiltered. Removing nothing is always
-# preferable here to removing the car.
-#
-# ----------------------------------------------------------------
-# BEV geometry, topic names, image constants and blob thresholds are
-# kept byte-identical to dynamic_detect_5.py so downstream consumers
-# (underneath_detection_6.py et al) see exactly the same conventions.
+# Outputs (unchanged for downstream): output_topic = cloud with movers
+# removed, movers_topic = the removed points.
 # ================================================================
 
 import rclpy
@@ -117,20 +46,19 @@ BEV_X_MIN  = -3.0;  BEV_X_MAX = 8.0
 BEV_Y_MIN  = -5.0;  BEV_Y_MAX = 5.0
 Z_MIN      =  0.0;  Z_MAX     = 0.8
 
-REF_ALPHA  = 0.05
-FAST_ALPHA = 0.35
+DIFF_WINDOW_SEC = 3.0   # points older than this expire from the diff image
+DIFF_DELAY_SEC  = 2.0   # reference = that window as it was this long ago
 
 INT_SCALE = 255.0
 
 DIFF_THRESH      = 20
 GRID_N           = 60
 CELL_PX          = BEV_SIZE // GRID_N
-CELL_ACTIVE_FRAC = 0.08
+CELL_ACTIVE_FRAC = 0.008
 MIN_CELL_PIXELS  = max(int(CELL_PX * CELL_PX * CELL_ACTIVE_FRAC), 3)
-PERSIST_K        = 3
 
 BLOB_MIN_PX  = CELL_PX * CELL_PX
-BLOB_MAX_PX  = CELL_PX * CELL_PX * 24
+BLOB_MAX_PX  = CELL_PX * CELL_PX * 6
 BLOB_MAX_ASP = 3.5
 
 CLOSE_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
@@ -180,6 +108,25 @@ def z_filter(cloud):
     return cloud[(cloud[:, 2] >= Z_MIN) & (cloud[:, 2] <= Z_MAX)]
 
 
+def yaw_from_quat(q):
+    return float(math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                            1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+
+
+def to_robot(cloud, pose):
+    """World-frame points -> robot frame (pose = x, y, yaw)."""
+    if len(cloud) == 0:
+        return cloud
+    x0, y0, yaw = pose
+    c, s = math.cos(yaw), math.sin(yaw)
+    dx = cloud[:, 0] - x0
+    dy = cloud[:, 1] - y0
+    out = cloud.copy()
+    out[:, 0] =  c * dx + s * dy
+    out[:, 1] = -s * dx + c * dy
+    return out
+
+
 def cloud_to_uv(cloud):
     X, Y = cloud[:, 0], cloud[:, 1]
     u = ((-Y - BEV_Y_MIN) / (BEV_Y_MAX - BEV_Y_MIN) * BEV_SIZE).astype(np.int32)
@@ -210,8 +157,16 @@ def build_bev_gray(cloud):
     return np.clip(avg / INT_SCALE * 255.0, 0, 255).astype(np.uint8)
 
 
+def render_gray(cloud_robot, dk):
+    """BEV -> dilate -> blur -> JET -> gray, exactly the image the diff
+    thresholds (DIFF_THRESH etc.) were tuned on."""
+    img8 = cv2.dilate(build_bev_gray(cloud_robot), dk, iterations=1)
+    img8 = cv2.GaussianBlur(img8, (5, 5), 0)
+    return cv2.cvtColor(cv2.applyColorMap(img8, cv2.COLORMAP_JET), cv2.COLOR_BGR2GRAY)
+
+
 # ================================================================
-# VISIBILITY / SHADOW  (new -- the actual fix)
+# VISIBILITY / SHADOW
 # ================================================================
 def azimuth_first_return(points_xy, sensor_xy, n_az_bins):
     """Nearest-return range per azimuth bin, as seen from sensor_xy.
@@ -236,8 +191,8 @@ def azimuth_first_return(points_xy, sensor_xy, n_az_bins):
 
 class VisibilitySolver:
     """Grid-resolution observed/unknown classification. The BEV window is
-    fixed in world coordinates, so cell centre positions are constant and
-    are precomputed once."""
+    robot-centred (sensor at the origin), so cell centre positions are
+    constant and are precomputed once."""
 
     def __init__(self, n_az_bins: int, shadow_margin_m: float):
         self.n_az_bins = n_az_bins
@@ -278,10 +233,10 @@ def upsample_grid(mask_grid: np.ndarray) -> np.ndarray:
 # FRAME DIFF
 # ================================================================
 def bev_frame_diff(cur_gray, ref_gray, observed_px):
-    """Same structure as dynamic_detect_5.bev_frame_diff, with the
-    disappearance evidence masked to observed pixels only. Returns
-    (labels, grid_mask, detections); each detection carries its label so
-    the caller can accept/reject per blob after tracking."""
+    """Disappeared-pixel diff (ref bright, current dark), masked to observed
+    pixels only. Returns (labels, detections); labels > 0 is the blob mask,
+    and each size-valid detection carries its label for optional per-blob
+    gating after tracking."""
     gone = np.clip(ref_gray.astype(np.int16) - cur_gray.astype(np.int16),
                    0, 255).astype(np.uint8)
     gone_bin = (gone > DIFF_THRESH) & observed_px
@@ -320,7 +275,7 @@ def bev_frame_diff(cur_gray, ref_gray, observed_px):
             "track": None,
         })
 
-    return labels, grid_mask, detections
+    return labels, detections
 
 
 # ================================================================
@@ -410,7 +365,9 @@ class DynamicFilterOcclusionAware(Node):
         self.declare_parameter("az_bins", 720)
         self.declare_parameter("shadow_margin_m", 0.15)
         self.declare_parameter("pose_timeout_s", 1.0)
-        self.declare_parameter("require_moving_track", True)
+        # off = remove every diff blob (like dynamic_detect_1_person_follow);
+        # on  = only blobs whose track is confirmed moving
+        self.declare_parameter("require_moving_track", False)
         self.declare_parameter("move_speed_min_mps", 0.15)
         self.declare_parameter("move_confirm_frames", 2)
         self.declare_parameter("publish_status", True)
@@ -428,14 +385,12 @@ class DynamicFilterOcclusionAware(Node):
         self._tracker = PersonTracker(float(gp("move_speed_min_mps").value),
                                        int(gp("move_confirm_frames").value))
 
-        self._dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        self._dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
-        self._ref     = None
-        self._fast    = None
-        self._persist = np.zeros((BEV_SIZE, BEV_SIZE), np.uint8)
-        self._was_observed = np.zeros((BEV_SIZE, BEV_SIZE), bool)
+        # (t, world-frame z-banded scan); long enough to rebuild the reference
+        self._hist = deque()
 
-        self._sensor_xy = None
+        self._pose = None            # (x, y, yaw) in world
         self._last_pose_time = 0.0
 
         sensor_qos = QoSProfile(
@@ -452,19 +407,17 @@ class DynamicFilterOcclusionAware(Node):
         self._status_pub = self.create_publisher(String, "/dynamic_filter_status", 10) \
             if self.publish_status else None
 
-        self._last_log = 0.0
         self._stats = {"passthrough_no_pose": 0, "removed_total": 0}
 
         self.get_logger().info(
             f"DynamicFilterOcclusionAware  in={TOPIC}  out={out_topic}  "
-            f"odom={odom_topic}  az_bins={gp('az_bins').value}  "
-            f"require_moving_track={self.require_moving_track}  "
-            f"(run INSTEAD OF dynamic_detect_5.py)")
+            f"odom={odom_topic}  window={DIFF_WINDOW_SEC}s delay={DIFF_DELAY_SEC}s  "
+            f"require_moving_track={self.require_moving_track}")
 
     # ─────────────────────────────────────────────────────────────
     def _odom_cb(self, msg: Odometry):
         p = msg.pose.pose.position
-        self._sensor_xy = np.array([p.x, p.y], dtype=np.float64)
+        self._pose = (p.x, p.y, yaw_from_quat(msg.pose.pose.orientation))
         self._last_pose_time = time.time()
 
     def _path_cb(self, msg: Path):
@@ -474,120 +427,95 @@ class DynamicFilterOcclusionAware(Node):
             return
         if (time.time() - self._last_pose_time) <= self.pose_timeout_s:
             return
-        p = msg.poses[-1].pose.position
-        self._sensor_xy = np.array([p.x, p.y], dtype=np.float64)
+        pose = msg.poses[-1].pose
+        self._pose = (pose.position.x, pose.position.y,
+                      yaw_from_quat(pose.orientation))
         self._last_pose_time = time.time()
 
     # ─────────────────────────────────────────────────────────────
     def _cb(self, msg: PointCloud2):
         t0 = time.time()
+        none = np.zeros((0, 4), np.float32)
 
         cloud_full = read_points_fast(msg)
         if len(cloud_full) == 0:
-            self._publish(cloud_full, np.zeros((0, 4), np.float32), msg)
+            self._publish(cloud_full, none, msg)
             return
 
-        # FAIL SAFE: without a pose we cannot tell shadow from free space,
-        # so nothing may be removed. Passing the whole cloud through is
-        # always preferable to deleting the car.
-        pose_fresh = (self._sensor_xy is not None and
-                      (t0 - self._last_pose_time) <= self.pose_timeout_s)
-        if not pose_fresh:
+        # FAIL SAFE: without a pose we cannot render the robot-frame BEV or
+        # tell shadow from free space, so nothing may be removed.
+        pose = self._pose
+        if pose is None or (t0 - self._last_pose_time) > self.pose_timeout_s:
             self._stats["passthrough_no_pose"] += 1
-            self._publish(cloud_full, np.zeros((0, 4), np.float32), msg)
-            self._maybe_log(t0, len(cloud_full), len(cloud_full), 0, 0, "NO_POSE")
+            self._publish(cloud_full, none, msg)
+            self._publish_status(len(cloud_full), len(cloud_full), 0, 0,
+                                 f"NO_POSE dt={int((time.time()-t0)*1000)}ms")
             return
 
         band = z_filter(cloud_full)
 
-        cur = build_bev_gray(band)
-        cur = cv2.dilate(cur, self._dk, iterations=1)
-        cur = cv2.GaussianBlur(cur, (5, 5), 0)
+        self._hist.append((t0, band))
+        keep_s = DIFF_WINDOW_SEC + DIFF_DELAY_SEC + 1.0
+        while self._hist and self._hist[0][0] < t0 - keep_s:
+            self._hist.popleft()
 
-        observed_grid = self._vis.observed_grid(band[:, :2], self._sensor_xy)
-        observed_px = upsample_grid(observed_grid)
-        observed_u8 = observed_px.astype(np.uint8)
-
-        if self._ref is None:
-            self._ref  = cur.astype(np.float32)
-            self._fast = cur.astype(np.float32)
-            self._was_observed = observed_px.copy()
-            self._publish(cloud_full, np.zeros((0, 4), np.float32), msg)
+        # Not enough history yet to have a reference from DIFF_DELAY_SEC ago.
+        if self._hist[0][0] > t0 - DIFF_DELAY_SEC:
+            self._publish(cloud_full, none, msg)
             return
 
-        # Re-baseline pixels that just came back from shadow: comparing a
-        # fresh observation against a reference from before the occlusion
-        # would manufacture one large false disappearance at the moment
-        # visibility returns.
-        reentered = observed_px & (~self._was_observed)
-        if reentered.any():
-            self._ref[reentered] = cur[reentered]
-            self._fast[reentered] = cur[reentered]
-            self._persist[reentered] = 0
-        self._was_observed = observed_px.copy()
+        # Current image: the last DIFF_WINDOW_SEC of points.
+        cur_world = np.vstack([c for (t, c) in self._hist
+                               if t >= t0 - DIFF_WINDOW_SEC])
+        cur_g = render_gray(to_robot(cur_world, pose), self._dk)
 
-        # EMAs advance only where the scene was actually observed; in
-        # shadow both images hold their last known value.
-        cv2.accumulateWeighted(cur, self._fast, FAST_ALPHA, mask=observed_u8)
-        fast_u8 = self._fast.astype(np.uint8)
-        ref_u8  = self._ref.astype(np.uint8)
+        # Reference: the same-length window ending DIFF_DELAY_SEC ago,
+        # re-rendered at the CURRENT pose so static things line up.
+        target = t0 - DIFF_DELAY_SEC
+        t_end = min(self._hist, key=lambda x: abs(x[0] - target))[0]
+        ref_world = np.vstack([c for (t, c) in self._hist
+                               if t_end - DIFF_WINDOW_SEC <= t <= t_end])
+        ref_g = render_gray(to_robot(ref_world, pose), self._dk)
 
-        labels, grid_mask, detections = bev_frame_diff(fast_u8, ref_u8, observed_px)
+        # Sensor sits at the origin of the robot-frame BEV.
+        band_r = to_robot(band, pose)
+        observed_grid = self._vis.observed_grid(band_r[:, :2], np.zeros(2))
+        observed_px = upsample_grid(observed_grid)
 
-        cv2.accumulateWeighted(cur, self._ref, REF_ALPHA, mask=observed_u8)
-
-        # Persistence counter also only advances where observed, so a
-        # static shadow cannot accumulate its way past PERSIST_K.
-        self._persist = np.where(observed_px & (grid_mask > 0),
-                                 np.minimum(self._persist + 1, 250),
-                                 np.where(observed_px, 0, self._persist)
-                                 ).astype(np.uint8)
-
+        labels, detections = bev_frame_diff(cur_g, ref_g, observed_px)
         tracks = self._tracker.update(detections, t0)
 
         if self.require_moving_track:
             keep = [d["lbl"] for d in detections
                     if d["track"] is not None and d["track"]["confirmed_moving"]]
+            removal_mask = np.isin(labels, keep)
         else:
-            keep = [d["lbl"] for d in detections]
+            removal_mask = labels > 0
 
-        if keep:
-            accepted_mask = np.isin(labels, keep)
-        else:
-            accepted_mask = np.zeros((BEV_SIZE, BEV_SIZE), dtype=bool)
-
-        removal_gate = accepted_mask & (self._persist >= PERSIST_K) & observed_px
-
-        if removal_gate.any():
-            u, v, valid = cloud_to_uv(cloud_full)
+        if removal_mask.any():
+            u, v, valid = cloud_to_uv(to_robot(cloud_full, pose))
             in_dyn = np.zeros(len(cloud_full), dtype=bool)
-            in_dyn[valid] = removal_gate[v[valid], u[valid]]
+            in_dyn[valid] = removal_mask[v[valid], u[valid]]
             cleaned = cloud_full[~in_dyn]
             movers  = cloud_full[in_dyn]
         else:
             cleaned = cloud_full
-            movers  = np.zeros((0, 4), dtype=np.float32)
+            movers  = none
 
         self._stats["removed_total"] += len(movers)
         self._publish(cleaned, movers, msg)
 
         shadow_frac = 1.0 - float(observed_grid.mean())
         n_moving = sum(1 for t in tracks if t["confirmed_moving"])
-        self._maybe_log(t0, len(cloud_full), len(cleaned), len(movers),
-                        n_moving, f"shadow={shadow_frac:.2f}")
+        self._publish_status(len(cloud_full), len(cleaned), len(movers), n_moving,
+                             f"shadow={shadow_frac:.2f} dt={int((time.time()-t0)*1000)}ms")
 
     # ─────────────────────────────────────────────────────────────
-    def _maybe_log(self, t0, n_in, n_kept, n_removed, n_moving, extra):
+    def _publish_status(self, n_in, n_kept, n_removed, n_moving, extra):
         if self._status_pub is not None:
             self._status_pub.publish(String(
                 data=f"in={n_in} kept={n_kept} removed={n_removed} "
                      f"movers={n_moving} {extra}"))
-        if t0 - self._last_log > 5.0:
-            self._last_log = t0
-            self.get_logger().info(
-                f"in={n_in} kept={n_kept} removed={n_removed} "
-                f"movers={n_moving} {extra} "
-                f"dt={int((time.time()-t0)*1000)}ms")
 
     def _publish(self, cleaned, movers, src_msg):
         self._dyn_pub.publish(

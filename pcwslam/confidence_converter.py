@@ -3,18 +3,22 @@
 confidence_converter  (pcwslam_confidence)
 =========================================
 
-The confidence -> SLAM-parameter converter, kept BYTE-FOR-BYTE at the scoring
-that was tuned against the laserMapping gates (formerly confidence_convert_2.py):
+The confidence -> SLAM-parameter converter (formerly confidence_convert_2.py):
 
-  robot_stop_conf = cmd(35%) + hole(35%) + detection(30%)   -> Gate 1 (IMU suppression)
+  robot_stop_conf = cmd(35%) + hole(30%) + detection(35%)   -> Gate 1 (IMU suppression)
   landmark_weight = landmark_conf * wheel_bonus * proximity  -> Gate 2 (residual correction)
+
+  hole rebalanced 35->30 (giving detection the freed 5) because the
+  hole/blind-spot signal only firms up late (once the robot is actually
+  under the car), so it's intentionally not weighted as heavily as
+  detection, which reflects real-time evidence. This formula is
+  independent of underneath_detection.py's cross_check_detections() --
+  that one scores /under_car_confidence itself and happens to also use
+  30% for its own (different) hole term; the two aren't linked, the match
+  is incidental.
 
   * blocking wait_for_service(0.2) so params are not silently dropped at startup
   * landmark source: /car_landmark_pose only, 2 s timeout, weight clamped [5, 100]
-
-The occlusion-robust variant (live/frozen landmark selection, decay, rescaled
-detection score) is `pcwslam_confidence_lmfreeze`
-(pcwslam/confidence_converter_landmark_freeze.py). Run ONE of the two, never both.
 """
 
 import rclpy
@@ -27,10 +31,15 @@ from std_msgs.msg import Int32, Float32, Bool, String  # noqa: F401
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
+import os
 import time
 import csv
 import math
 from datetime import datetime
+
+# CSVs always land here no matter where the node was launched from
+# (override with the PCWSLAM_LOG_DIR environment variable).
+LOG_DIR = os.path.expanduser(os.environ.get('PCWSLAM_LOG_DIR', '~/pcwslam_logs'))
 
 
 class ConfidenceConverter(Node):
@@ -86,7 +95,8 @@ class ConfidenceConverter(Node):
 
         # ── CSV logging ───────────────────────────────────────────
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.csv_filename = f'confidence_log_{ts}.csv'
+        os.makedirs(LOG_DIR, exist_ok=True)
+        self.csv_filename = os.path.join(LOG_DIR, f'confidence_log_{ts}.csv')
         self.csv_file   = open(self.csv_filename, 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
@@ -103,6 +113,9 @@ class ConfidenceConverter(Node):
         ])
 
         # ── Timer 10 Hz ───────────────────────────────────────────
+        # per-tick status line (was a terminal INFO) -> ros2 topic echo /confidence_status
+        self.status_pub = self.create_publisher(String, '/confidence_status', 10)
+
         self.timer = self.create_timer(0.1, self.update_confidence)
 
         self.get_logger().info(
@@ -198,24 +211,29 @@ class ConfidenceConverter(Node):
             min(abs(self.angular_vel) / 1.0, 1.0))
         cmd_score = 35.0 * (1.0 - motion_norm)
 
-        # ── 2. LiDAR hole score (35%) ─────────────────────────────
+        # ── 2. LiDAR hole score (30%) ─────────────────────────────
         hole_clamped = max(1000.0, min(3000.0, self.hole_area))
         hole_norm    = (hole_clamped - 1000.0) / 2000.0
-        target_hole  = hole_norm * 35.0
+        target_hole  = hole_norm * 30.0
 
         if (now - self.last_hole_time) < 0.5:
             self.hole_score_memory = target_hole
         else:
-            self.hole_score_memory = max(0.0, self.hole_score_memory - 0.5)
+            # Decay rate scaled down from the original 0.5/tick (at the old
+            # 35-pt ceiling) to 30/35 of that, so a stale reading still
+            # takes the same ~7s (70 ticks @ 10Hz) to fully decay from the
+            # new 30-pt ceiling instead of decaying faster just because the
+            # ceiling dropped.
+            self.hole_score_memory = max(0.0, self.hole_score_memory - 0.5 * (30.0/35.0))
         hole_score = self.hole_score_memory
 
-        # ── 3. Under-car detection score (30%) ────────────────────
+        # ── 3. Under-car detection score (35%) ────────────────────
         # Uses our new detection node's confidence:
         #   under_car_conf (0–1) from cross-check of BEV + side views
         #   Boosted by confirmed wheel count
         wheel_bonus    = self.wheel_count / 4.0        # 0–1
         detection_conf = self.under_car_conf * (0.7 + 0.3 * wheel_bonus)
-        detection_score = detection_conf * 30.0
+        detection_score = detection_conf * 35.0
 
         # ── Final confidence ──────────────────────────────────────
         confidence = int(max(0, min(100,
@@ -270,16 +288,16 @@ class ConfidenceConverter(Node):
         ])
         self.csv_file.flush()
 
-        # ── Terminal log ──────────────────────────────────────────
+        # ── Status topic ──────────────────────────────────────────
         lm_str = (f'LM({self.landmark_x:.2f},{self.landmark_y:.2f}) '
                   f'w={lm_weight:.1f} '
                   if self.landmark_active else 'LM=off ')
-        self.get_logger().info(
+        self.status_pub.publish(String(data=
             f'CONF={confidence:3d}  '
             f'cmd={cmd_score:.0f} hole={hole_score:.0f} '
             f'det={detection_score:.0f}  '
             f'{lm_str}'
-            f'wheels={self.wheel_count}/4')
+            f'wheels={self.wheel_count}/4'))
 
     def destroy_node(self):
         self.csv_file.close()

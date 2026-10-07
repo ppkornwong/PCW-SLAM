@@ -4,6 +4,7 @@ pcwslam.launch.py -- the mapping node's launch + the 4 pcwslam nodes.
     ros2 launch pcwslam pcwslam.launch.py
 
 args: slam:=false  slam_launch:=<path>  slam_pkg:=<name>  rviz:=false
+      robot_model:=false  (URDF + aft_mapped->base_link TF, see robot_model.launch.py)
       dynamic_filter:=false  underneath:=false  confidence:=false
       transmitter:=false  display:=false  params:=<yaml>
 
@@ -69,6 +70,7 @@ def generate_launch_description():
         DeclareLaunchArgument("confidence", default_value="true"),
         DeclareLaunchArgument("transmitter", default_value="true"),
         DeclareLaunchArgument("rviz", default_value="true"),
+        DeclareLaunchArgument("robot_model", default_value="true"),
         DeclareLaunchArgument("display", default_value="true"),
         DeclareLaunchArgument("params", default_value=default_params),
     ]
@@ -99,9 +101,15 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(LaunchConfiguration("transmitter")))
 
+    robot_model = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_share, "launch", "robot_model.launch.py")),
+        condition=IfCondition(LaunchConfiguration("robot_model")))
+
     return LaunchDescription(args + [
         LogInfo(msg="[pcwslam] starting stack: SLAM backend + dynamic_filter + "
                     "underneath + confidence + transmitter"),
         OpaqueFunction(function=_slam),
+        robot_model,
         dynamic_filter, underneath, confidence, transmitter,
     ])

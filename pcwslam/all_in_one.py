@@ -10,10 +10,6 @@ Runs all four PCW-SLAM add-on nodes in **one process**:
     - ConfidenceConverter              (confidence_converter.py)
     - TransmitterAlignmentNode         (transmitter_alignment.py)
 
-The confidence node here is the reference scoring (pcwslam_confidence). To use
-the occlusion-robust landmark-freeze variant instead, run that node separately
-(pcwslam_confidence_lmfreeze) with `confidence:=false` on the others.
-
 This is the "one file / one command" way to launch the add-ons.  It does NOT
 start the SLAM backend itself -- run the SLAM first (see README), then:
 
